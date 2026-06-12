@@ -1,0 +1,30 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  Real-Time Indian Grocery Price Comparison — requirements.txt
+#
+#  Install:  pip install -r requirements.txt
+#  Run:      streamlit run app.py        (after starting Kafka — see README)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Dashboard & UI ─────────────────────────────────────────────────────────────
+streamlit>=1.32.0
+pandas>=2.0.0
+plotly>=5.18.0
+
+# ── Web Scraping (Selenium headless Chrome) ────────────────────────────────────
+selenium>=4.18.0
+webdriver-manager>=4.0.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# ── Apache Kafka (message queue) ───────────────────────────────────────────────
+# Requires a Kafka broker running at localhost:9092
+# Setup: see README → "Kafka Setup (Windows, no Docker)"
+kafka-python==2.0.2
+
+# ── Apache Spark (stream processing) ──────────────────────────────────────────
+# Requires Java 11+ installed (https://adoptium.net)
+# Already installed via:  pip install pyspark
+pyspark>=4.0.0
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0

@@ -1,0 +1,272 @@
+version: "3.9"
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Real-Time Indian Grocery Price Comparison — Full Stack Docker Compose
+#  Services: Zookeeper, Kafka, Schema Registry, MySQL, Spark, MLflow,
+#            ML API (FastAPI), Streamlit Dashboard
+# ═══════════════════════════════════════════════════════════════════════
+
+networks:
+  price-compare-network:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  mlflow_artifacts:
+  spark_checkpoint:
+  logs_data:
+
+services:
+
+  # ── Zookeeper ────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    networks: [price-compare-network]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Kafka Broker ─────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    networks: [price-compare-network]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ── Schema Registry ───────────────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: schema-registry
+    networks: [price-compare-network]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "kafka:29092"
+
+  # ── Kafka Topic Creator (runs once) ──────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init
+    networks: [price-compare-network]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c", "
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --topic raw-prices &&
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --topic clean-prices &&
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1 --topic ml-scores &&
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1 --topic search-events &&
+      echo 'Topics created successfully'
+    "]
+    restart: "no"
+
+  # ── MySQL 8 ───────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    networks: [price-compare-network]
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_USER: priceuser
+      MYSQL_PASSWORD: "PriceCompare@123"
+      MYSQL_DATABASE: clean_store
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./src/storage/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_allowed_packet=64M
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "priceuser", "-pPriceCompare@123"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Spark Master ──────────────────────────────────────────────────────
+  spark-master:
+    image: bitnami/spark:3.5.1
+    container_name: spark-master
+    networks: [price-compare-network]
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Spark Worker ──────────────────────────────────────────────────────
+  spark-worker:
+    image: bitnami/spark:3.5.1
+    container_name: spark-worker
+    networks: [price-compare-network]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8082:8081"
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: "spark://spark-master:7077"
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+
+  # ── MLflow Tracking Server ────────────────────────────────────────────
+  mlflow:
+    image: python:3.11-slim
+    container_name: mlflow
+    networks: [price-compare-network]
+    ports:
+      - "5001:5001"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    command: >
+      bash -c "
+        pip install mlflow sqlalchemy pymysql -q &&
+        mlflow server
+          --backend-store-uri sqlite:////mlflow/mlflow.db
+          --default-artifact-root /mlflow/artifacts
+          --host 0.0.0.0
+          --port 5001
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ── ML Inference API (FastAPI) ────────────────────────────────────────
+  ml-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ml-api
+    container_name: ml-api
+    networks: [price-compare-network]
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      MLFLOW_TRACKING_URI: "http://mlflow:5001"
+      DEMO_MODE: "true"
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+    command: ["python", "src/processing/ml_api.py"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ── Streamlit Dashboard ───────────────────────────────────────────────
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: streamlit
+    container_name: streamlit
+    networks: [price-compare-network]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      MYSQL_HOST: mysql
+      MYSQL_USER: priceuser
+      MYSQL_PASSWORD: "PriceCompare@123"
+      MYSQL_CLEAN_DB: clean_store
+      ML_API_HOST: ml-api
+      ML_API_PORT: "8000"
+      DEMO_MODE: "true"
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./config:/app/config
+      - logs_data:/app/logs
+    command: ["streamlit", "run", "src/frontend/app.py",
+              "--server.port=8501",
+              "--server.address=0.0.0.0",
+              "--server.headless=true",
+              "--browser.gatherUsageStats=false"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ── Spark Processor (submits job) ─────────────────────────────────────
+  spark-submit:
+    image: bitnami/spark:3.5.1
+    container_name: spark-submit
+    networks: [price-compare-network]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+      - spark_checkpoint:/app/data/spark_checkpoint
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      MYSQL_HOST: mysql
+      MYSQL_USER: priceuser
+      MYSQL_PASSWORD: "PriceCompare@123"
+    command: >
+      spark-submit
+        --master spark://spark-master:7077
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,mysql:mysql-connector-java:8.0.33
+        /app/src/processing/spark_processor.py
+    restart: on-failure
